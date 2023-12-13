@@ -6,6 +6,7 @@ library(tidyverse)
 library(tidymodels)
 library(embed)
 library(discrim)
+library(stacks)
 
 # data
 train <- vroom("./train.csv")
@@ -58,20 +59,29 @@ DataExplorer::plot_missing(test) # percent missing in each column
 
 Years <- unique(format(as.Date(test$Open_Date, format="%m/%d/%Y"),"%Y"))
 
-my_recipe <- recipe(revenue ~ ., data=train) %>%
+my_recipe_pen <- recipe(revenue ~ ., data=train) %>%
+  # step_mutate(revenue = factor(revenue), skip = TRUE) %>% # for KNN
   step_mutate(Open_Date = as.Date(Open_Date, '%m/%d/%Y')) %>%
   step_date(Open_Date, features=c('dow', 'month', 'year', 'quarter')) %>%
   step_mutate(Open_Date_year = factor(Open_Date_year, levels = Years),
               Open_Date_quarter = factor(Open_Date_quarter),
               Type=factor(Type, levels=c("FC", "IL", "DT", "MB"))) %>%
-  step_novel(all_nominal_predictors()) %>%
+  step_rm(City, Open_Date, Id) %>%
+  step_normalize(all_numeric_predictors())
+
+my_recipe <- recipe(revenue ~ ., data=train) %>%
+  # step_mutate(revenue = factor(revenue), skip = TRUE) %>% # for KNN
+  step_mutate(Open_Date = as.Date(Open_Date, '%m/%d/%Y')) %>%
+  step_date(Open_Date, features=c('dow', 'month', 'year', 'quarter')) %>%
+  step_mutate(Open_Date_year = factor(Open_Date_year, levels = Years),
+              Open_Date_quarter = factor(Open_Date_quarter),
+              Type=factor(Type, levels=c("FC", "IL", "DT"))) %>%
   step_rm(City, Open_Date, Id)
 
 # make sure prep/bake works
-
 prepped_recipe <- prep(my_recipe) 
-new_data <- bake(prepped_recipe, new_data = train)
-DataExplorer::plot_missing(test)
+new_data <- bake(prepped_recipe, new_data = test)
+DataExplorer::plot_missing(new_data)
 #sapply(new_data, class)
 
 # folds for cv
@@ -81,6 +91,42 @@ folds <- vfold_cv(train, v = 5, repeats=1)
 ### Models to Try
 #############################
 
+### KNN ###
+knn_mod <- nearest_neighbor(neighbors = tune()) %>%
+  set_mode('classification') %>%
+  set_engine('kknn')
+
+knn_wf <- workflow() %>%
+  add_recipe(my_recipe) %>%
+  add_model(knn_mod)
+
+tune_grid <- grid_regular(neighbors(), levels = 10)
+
+## Set up K-fold CV
+# use folds from above
+CV_results <- knn_wf %>%
+  tune_grid(resamples=folds,
+            grid=tune_grid,
+            metrics=metric_set(roc_auc)) #Or leave metrics NULL
+
+## Find best tuning parameters
+bestTune <- CV_results %>%
+  select_best("roc_auc")
+
+## Finalize workflow and predict
+final_wf <- knn_wf %>%
+  finalize_workflow(bestTune) %>%
+  fit(data=train)
+
+## Predict
+test_preds <- final_wf %>%
+  predict(new_data = test) %>%
+  bind_cols(., test) %>% #Bind predictions with test data
+  select(Id, .pred_class) %>% #Just keep datetime and predictions
+  rename(Prediction=.pred_class) #rename pred to Prediction (for submission to Kaggle)
+
+## Write prediction file to CSV
+vroom_write(x=test_preds, file="./KNNSubmission1.csv", delim=",")
 
 
 
@@ -128,6 +174,78 @@ test_preds <- final_wf %>%
 
 ## Write prediction file to CSV
 vroom_write(x=test_preds, file="./RFSubmission21.csv", delim=",")
+
+
+
+
+
+### Model Stacking ###
+
+# use my_recipe
+# use prev folds var
+
+## control settings for stacking models
+untunedModel <- control_stack_grid() # need to be tuned
+tunedModel <- control_stack_resamples()
+
+## Set up linear model
+lin_model_modstack <- linear_reg() %>%
+  set_engine("lm")
+
+## Set workflow
+linreg_wf_modstack <- workflow() %>%
+  add_recipe(my_recipe) %>%
+  add_model(lin_model_modstack)
+
+## fit linear to folds
+linreg_folds_fit <- linreg_wf_modstack %>%
+  fit_resamples(resamples = folds,
+                control = tunedModel)
+
+
+## Reg Tree
+## set up the model for regression trees
+regtree_modstack <- decision_tree(tree_depth = tune(),
+                        cost_complexity = tune(),
+                        min_n=tune()) %>% #Type of model
+  set_engine("rpart") %>% # Engine = What R function to use
+  set_mode("regression")
+
+
+## Workflow
+regTree_wf_modstack <- workflow() %>%
+  add_recipe(my_recipe) %>%
+  add_model(regtree_modstack)
+
+## Grid for tuning
+regtree_modstack_tunegrid <- grid_regular(tree_depth(),
+                                          cost_complexity(),
+                                          min_n(),
+                                          levels = 5)
+
+## Tune the Model
+tree_folds_fit_modstack <- regTree_wf_modstack %>%
+  tune_grid(resamples = folds,
+            grid = regtree_modstack_tunegrid,
+            metrics = metric_set(rmse),
+            control = untunedModel)
+
+## Stacking time
+
+stack <- stacks() %>%
+  add_candidates(linreg_folds_fit) %>%
+  add_candidates(tree_folds_fit_modstack)
+
+fitted_stack <- stack %>%
+  blend_predictions() %>%
+  fit_members()
+
+## Predictions
+modstack_preds <- predict(fitted_stack, new_data = test)
+
+
+
+
 
 #############################
 ### Future work with imputation
