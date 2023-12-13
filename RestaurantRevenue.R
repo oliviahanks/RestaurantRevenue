@@ -7,6 +7,8 @@ library(tidymodels)
 library(embed)
 library(discrim)
 library(stacks)
+library(parsnip)
+library(dials)
 
 # data
 train <- vroom("./train.csv")
@@ -69,14 +71,27 @@ my_recipe_pen <- recipe(revenue ~ ., data=train) %>%
   step_rm(City, Open_Date, Id) %>%
   step_normalize(all_numeric_predictors())
 
+Years <- unique(format(as.Date(test$Open_Date, format="%m/%d/%Y"),"%Y"))
+
 my_recipe <- recipe(revenue ~ ., data=train) %>%
-  # step_mutate(revenue = factor(revenue), skip = TRUE) %>% # for KNN
   step_mutate(Open_Date = as.Date(Open_Date, '%m/%d/%Y')) %>%
   step_date(Open_Date, features=c('dow', 'month', 'year', 'quarter')) %>%
   step_mutate(Open_Date_year = factor(Open_Date_year, levels = Years),
               Open_Date_quarter = factor(Open_Date_quarter),
               Type=factor(Type, levels=c("FC", "IL", "DT"))) %>%
   step_rm(City, Open_Date, Id)
+
+
+my_recipe <- recipe(revenue ~ ., data=train) %>%
+  step_mutate(Open_Date = as.Date(Open_Date, '%m/%d/%Y')) %>%
+  step_date(Open_Date, features=c('dow', 'month', 'year', 'quarter')) %>%
+  step_mutate(Open_Date_year = factor(Open_Date_year, levels = Years),
+              Open_Date_quarter = factor(Open_Date_quarter),
+              Type=factor(Type, levels=c("FC", "IL", "DT", "MB"))) %>%
+  step_rm(City, Open_Date, Id) %>%
+  step_other(all_nominal(), threshold = .01) %>%
+  step_zv(all_nominal())
+
 
 # make sure prep/bake works
 prepped_recipe <- prep(my_recipe) 
@@ -173,37 +188,167 @@ test_preds <- final_wf %>%
   rename(Prediction=.pred) #rename pred to Prediction (for submission to Kaggle)
 
 ## Write prediction file to CSV
-vroom_write(x=test_preds, file="./RFSubmission21.csv", delim=",")
+vroom_write(x=test_preds, file="./RFSubmission2.csv", delim=",")
 
 
+##########################
+### XGBoost
+##########################
+
+ames_cv_folds <- 
+  my_recipe %>% 
+  prep() %>%
+  bake( 
+    new_data = train) %>%  
+  rsample::vfold_cv(v = 5)
+
+# XGBoost model specification
+xgboost_model <- 
+  boost_tree(
+    mode = "regression",
+    trees = 500,
+    min_n = tune(),
+    tree_depth = tune(),
+    learn_rate = tune(),
+    loss_reduction = tune()
+  ) %>%
+    set_engine("xgboost", objective = "reg:squarederror")
+
+# grid specification
+xgboost_params <- 
+  parameters(
+    min_n(),
+    tree_depth(),
+    learn_rate(),
+    loss_reduction()
+  )
+
+xgboost_grid <- 
+  dials::grid_max_entropy(
+    xgboost_params, 
+    size = 60
+  )
+#knitr::kable(head(xgboost_grid))
+
+xgboost_wf <- 
+  workflow() %>%
+  add_model(xgboost_model) %>% 
+  add_formula(revenue ~ .)
+
+# hyperparameter tuning
+xgboost_tuned <- tune_grid(
+  object = xgboost_wf,
+  resamples = ames_cv_folds,
+  grid = xgboost_grid,
+  metrics = yardstick::metric_set(rmse),
+  control = tune::control_grid(verbose = TRUE)
+)
+
+xgboost_best_params <- xgboost_tuned %>%
+  tune::select_best("rmse")
+
+xgboost_model_final <- xgboost_model %>% 
+  finalize_model(xgboost_best_params)
+
+train_processed <- my_recipe %>% prep %>% bake(new_data = train)
+
+train_prediction <- xgboost_model_final %>%
+  # fit the model on all the training data
+  fit(
+    formula = revenue ~ ., 
+    data    = train_processed
+  ) %>%
+  # predict the sale prices for the training data
+  predict(new_data = train_processed) %>%
+  bind_cols(train)
+
+xgboost_score_train <- 
+  train_prediction %>%
+  yardstick::metrics(revenue, .pred) %>%
+  mutate(.estimate = format(round(.estimate, 2), big.mark = ","))
+
+knitr::kable(xgboost_score_train)
+
+test_processed  <- my_recipe %>% prep %>% bake(new_data = test)
+
+test_prediction <- xgboost_model_final %>%
+  # fit the model on all the training data
+  fit(
+    formula = revenue ~ ., 
+    data    = train_processed
+  ) %>%
+  # use the training model fit to predict the test data
+  predict(new_data = test_processed) %>%
+  bind_cols(test)
+
+test_preds <- test_prediction %>%
+  select(Id, .pred) %>%
+  rename(Prediction = .pred)
+
+vroom_write(x=test_preds, file="./XGSubmission2.csv", delim=",")
 
 
-
-### Model Stacking ###
-
-# use my_recipe
-# use prev folds var
+##########################
+ ### Model Stacking ###
+#########################
 
 ## control settings for stacking models
 untunedModel <- control_stack_grid() # need to be tuned
 tunedModel <- control_stack_resamples()
 
-## Set up linear model
-lin_model_modstack <- linear_reg() %>%
-  set_engine("lm")
+### XGBoost ###
 
-## Set workflow
-linreg_wf_modstack <- workflow() %>%
-  add_recipe(my_recipe) %>%
-  add_model(lin_model_modstack)
+ames_cv_folds <- 
+  my_recipe %>% 
+  prep() %>%
+  bake( 
+    new_data = train) %>%  
+  rsample::vfold_cv(v = 5)
 
-## fit linear to folds
-linreg_folds_fit <- linreg_wf_modstack %>%
-  fit_resamples(resamples = folds,
-                control = tunedModel)
+# XGBoost model specification
+xgboost_model <- 
+  boost_tree(
+    mode = "regression",
+    trees = 500,
+    min_n = tune(),
+    tree_depth = tune(),
+    learn_rate = tune(),
+    loss_reduction = tune()
+  ) %>%
+    set_engine("xgboost", objective = "reg:squarederror")
+
+# grid specification
+xgboost_params <- 
+  parameters(
+    min_n(),
+    tree_depth(),
+    learn_rate(),
+    loss_reduction()
+  )
+
+xgboost_grid <- 
+  dials::grid_max_entropy(
+    xgboost_params, 
+    size = 60
+  )
+#knitr::kable(head(xgboost_grid))
+
+xgboost_wf <- 
+  workflow() %>%
+  add_model(xgboost_model) %>% 
+  add_formula(revenue ~ .)
+
+# hyperparameter tuning
+xgboost_tuned <- tune_grid(
+  object = xgboost_wf,
+  resamples = ames_cv_folds,
+  grid = xgboost_grid,
+  metrics = yardstick::metric_set(rmse),
+  control = tune::control_grid(verbose = TRUE)
+)
 
 
-## Reg Tree
+### Reg Tree ###
 ## set up the model for regression trees
 regtree_modstack <- decision_tree(tree_depth = tune(),
                         cost_complexity = tune(),
@@ -233,7 +378,7 @@ tree_folds_fit_modstack <- regTree_wf_modstack %>%
 ## Stacking time
 
 stack <- stacks() %>%
-  add_candidates(linreg_folds_fit) %>%
+  add_candidates(xgboost_tuned) %>%
   add_candidates(tree_folds_fit_modstack)
 
 fitted_stack <- stack %>%
