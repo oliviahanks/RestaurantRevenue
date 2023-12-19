@@ -85,13 +85,15 @@ my_recipe <- recipe(revenue ~ ., data=train) %>%
 my_recipe <- recipe(revenue ~ ., data=train) %>%
   step_mutate(Open_Date = as.Date(Open_Date, '%m/%d/%Y')) %>%
   step_date(Open_Date, features=c('dow', 'month', 'year', 'quarter')) %>%
-  step_mutate(Open_Date_year = factor(Open_Date_year, levels = Years),
+  step_mutate(Open_Date_year = factor(Open_Date_year),
               Open_Date_quarter = factor(Open_Date_quarter),
-              Type=factor(Type, levels=c("FC", "IL", "DT", "MB"))) %>%
+              Type=factor(Type)) %>%
+  step_novel(Open_Date_year, Type) %>%
   step_rm(City, Open_Date, Id) %>%
   step_other(all_nominal(), threshold = .01) %>%
   step_zv(all_nominal())
 
+#https://www.datasciencemadesimple.com/get-difference-between-two-dates-in-r-by-days-weeks-months-and-years-r-2/
 
 # make sure prep/bake works
 prepped_recipe <- prep(my_recipe) 
@@ -298,13 +300,6 @@ tunedModel <- control_stack_resamples()
 
 ### XGBoost ###
 
-ames_cv_folds <- 
-  my_recipe %>% 
-  prep() %>%
-  bake( 
-    new_data = train) %>%  
-  rsample::vfold_cv(v = 5)
-
 # XGBoost model specification
 xgboost_model <- 
   boost_tree(
@@ -341,12 +336,11 @@ xgboost_wf <-
 # hyperparameter tuning
 xgboost_tuned <- tune_grid(
   object = xgboost_wf,
-  resamples = ames_cv_folds,
+  resamples = folds,
   grid = xgboost_grid,
   metrics = yardstick::metric_set(rmse),
-  control = tune::control_grid(verbose = TRUE)
+  control = untunedModel
 )
-
 
 ### Reg Tree ###
 ## set up the model for regression trees
